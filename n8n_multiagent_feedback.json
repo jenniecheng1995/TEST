@@ -1,0 +1,344 @@
+{
+  "name": "Multi‑Agent Router + Feedback (MCP-first, JSONalyze, Calc, Chart, SQL fallback)",
+  "nodes": [
+    {
+      "id": "WebhookIn",
+      "name": "Chat In (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -760,
+        -80
+      ],
+      "parameters": {
+        "path": "chat-in",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "RouterCode",
+      "name": "A0 Router (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        -80
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\n// Expect input JSON: { user_input: string, session_memory?: object }\n// Output: { router: { needs, timeParams, plan, notes } }\nconst input = items[0]?.json || {};\nconst text = (input.user_input || \"\").trim();\nconst sessionMemory = input.session_memory || {};\n\nfunction isoNowTaipei() {\n  const d = new Date();\n  const pad = n => String(n).padStart(2,'0');\n  // +08:00 fixed offset (Asia/Taipei)\n  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}+08:00`;\n}\n\nfunction parseDateRange(t) {\n  const lower = t.toLowerCase();\n  if (/(today|今天)/.test(lower)) return 'today';\n  if (/(yesterday|昨天)/.test(lower)) return 'yesterday';\n  if (/(last\\\\s*7\\\\s*days|近\\\\s*7\\\\s*天|過去7天)/.test(lower)) return 'last_7_days';\n  if (/(this\\\\s*month|本月|這個月)/.test(lower)) return 'this_month';\n  if (/(last\\\\s*month|上個月|上月)/.test(lower)) return 'last_month';\n  return sessionMemory.default_date_range || 'today';\n}\n\nfunction detectNeeds(t) {\n  const lower = t.toLowerCase();\n  return {\n    needChart: /(chart|圖表|折線|長條|圓餅|畫圖)/.test(lower),\n    needSortOrGroup: /(group\\\\s*by|排序|排名|分組|聚合|總和|平均|百分位|中位數|前|top\\\\s*\\\\d+)/.test(lower),\n    simpleCalc: /(加總|總和|ratio|比例|%|百分比|平均|差|\\\\+|\\\\-|\\\\*|\\\\/|=)/.test(lower) && !/(回歸|預測|模型)/.test(lower),\n    mustSQL: /(\\\\bsql\\\\b|資料庫|join|多表|視窗函數|cte)/.test(lower),\n  };\n}\n\nconst needs = detectNeeds(text);\nconst dateRange = parseDateRange(text);\nconst timeParams = { now: isoNowTaipei(), date_range: dateRange };\n\nconst plan = [];\nplan.push({ step: \"A1_MCP\", reason: \"預設先用 MCP 取數\", params: { timeParams } });\nif (needs.needSortOrGroup) plan.push({ step: \"A3_JSONALYZE\", reason: \"需要在 JSON 上進行 group/sort/聚合\", params: {} });\nif (needs.simpleCalc)      plan.push({ step: \"A4_CALC\",      reason: \"偵測到簡易計算\", params: {} });\nif (needs.needChart)       plan.push({ step: \"A5_CHART\",     reason: \"使用者要求圖表（資料源限定 MCP→JSONalyze）\", params: { typeHint: \"auto\" } });\nif (needs.mustSQL)         plan.push({ step: \"A2_SQL\",       reason: \"明講需要 SQL 或疑似 DB 聚合/join\", params: { timeParams } });\n\nreturn [{ json: { router: { needs, timeParams, plan, notes: \"Chart 只吃 MCP→(A3) 結果；MCP 無資料才退回 SQL。\" }, user_input: text } }];\n"
+      }
+    },
+    {
+      "id": "MCP",
+      "name": "A1 MCP (HTTP Request placeholder)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -260,
+        -220
+      ],
+      "parameters": {
+        "url": "https://YOUR_MCP_ENDPOINT/report",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\"task\": \"{{$json.user_input}}\", \"time_params\": \"={{$json[\\\"router\\\"][\\\"timeParams\\\"]}}\"}",
+        "sendBody": true
+      }
+    },
+    {
+      "id": "JSONALYZE",
+      "name": "A3 JSONalyze (HTTP Request placeholder)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        40,
+        -220
+      ],
+      "parameters": {
+        "url": "https://YOUR_JSONALYZE_ENDPOINT/transform",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\"op\": \"auto_from_router\", \"input_data\": \"={{$json[\\\"data\\\"] || $json[\\\"MCP_data\\\"] || $json}}\", \"router_needs\": \"={{$json[\\\"router\\\"][\\\"needs\\\"]}}\"}",
+        "sendBody": true
+      }
+    },
+    {
+      "id": "Calc",
+      "name": "A4 Calc (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        -220
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\n// Input optional: { calc: { expr: \"(a-b)/b\", vars: {a:120, b:100} } }\nconst ctx = items[0].json;\nconst req = ctx.calc || null;\nfunction safeEval(expr, vars) {\n  if (!expr) return null;\n  if (!/^[0-9+\\-*/().%\\s_a-zA-Z]+$/.test(expr)) throw new Error('Bad expr');\n  const keys = Object.keys(vars || {});\n  const vals = keys.map(k => Number(vars[k]));\n  const fn = new Function(...keys, `return ${expr};`);\n  return fn(...vals);\n}\nlet result = null;\nif (req?.expr) result = safeEval(req.expr, req.vars || {});\nreturn [{ json: { ...ctx, calc_result: result } }];\n"
+      }
+    },
+    {
+      "id": "Chart",
+      "name": "A5 Chart (HTTP Request placeholder)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        520,
+        -220
+      ],
+      "parameters": {
+        "url": "https://YOUR_CHART_ENDPOINT/render",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\"data\": \"={{$json[\\\"data\\\"] || $json[\\\"jsonalyze_result\\\"] || $json}}\", \"chart_spec\": {\"type\": \"={{$json[\\\"router\\\"][\\\"needs\\\"][\\\"needChart\\\"] ? \\\"auto\\\" : \\\"none\\\"}}\", \"title\": \"MCP Chart\"}}",
+        "sendBody": true
+      }
+    },
+    {
+      "id": "SQLPlan",
+      "name": "A2 SQL Plan (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -260,
+        90
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\n// Generate a minimal SQL when MCP reports no_data or mustSQL is true\n// Expect input: { router, user_input, mcp_status? }\nconst j = items[0].json;\nconst dateRange = j.router?.timeParams?.date_range || 'this_month';\nconst where = (dateRange==='today') ? \"date = CURRENT_DATE\" :\n              (dateRange==='this_month') ? \"date >= date_trunc('month', CURRENT_DATE)\" :\n              (dateRange==='last_7_days') ? \"date >= CURRENT_DATE - INTERVAL '7 days'\" :\n              \"1=1\";\nconst sql = `SELECT date, brand, revenue\n             FROM sales\n             WHERE ${where}\n             ORDER BY date DESC\n             LIMIT 100`;\nreturn [{ json: { sql, notes: \"auto-generated (replace table/fields)\", risk: \"medium\" } }];\n"
+      }
+    },
+    {
+      "id": "SQLExec",
+      "name": "A2 SQL Exec (HTTP Request placeholder)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -20,
+        90
+      ],
+      "parameters": {
+        "url": "https://YOUR_SQL_API/execute",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\"sql\": \"={{$json[\\\"sql\\\"]}}\"}",
+        "sendBody": true
+      }
+    },
+    {
+      "id": "Composer",
+      "name": "A6 Answer Composer (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        -220
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\n// Compose final markdown-ish answer.\nconst j = items[0].json;\nconst tools = [];\nif (j.meta?.source === 'MCP' || j.MCP) tools.push('MCP');\nif (j.jsonalyze_result || j.transform) tools.push('JSONalyze');\nif (j.calc_result !== undefined) tools.push('Calc');\nif (j.chart?.url || j.chart_url) tools.push('Chart');\nif (j.sql || j.sql_result) tools.push('SQL');\n\nconst md = [\n  `### 回覆`,\n  `- 來源工具：${tools.join(' + ') || '（未識別）'}`,\n  j.summary || '（此處可填最終結論與重點）',\n].join('\\\\n');\n\nreturn [{ json: { reply: md, raw: j } }];\n"
+      }
+    },
+    {
+      "id": "Respond",
+      "name": "Respond (Webhook)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -220
+      ],
+      "parameters": {
+        "responseBody": "={{$json[\"reply\"]}}",
+        "responseCode": 200
+      }
+    },
+    {
+      "id": "FeedbackWebhook",
+      "name": "Feedback In (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -760,
+        360
+      ],
+      "parameters": {
+        "path": "feedback-in",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "FeedbackHandler",
+      "name": "Feedback Handler (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        360
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\n// Expect: { thumbs_up: true, user_id, user_input, plan, tools, fingerprint }\n// Normalize query and produce record for Data Store\nconst j = items[0].json || {};\nconst norm = (s) => (s||'').toLowerCase()\n  .replace(/[^\\p{L}\\p{N}\\s]/gu,' ')\n  .replace(/\\s+/g,' ')\n  .trim();\nconst rec = {\n  user_id: j.user_id || 'unknown',\n  query_norm: norm(j.user_input),\n  fingerprint: j.fingerprint || {},\n  plan: j.plan || [],\n  tools: j.tools || {},\n  success: j.thumbs_up ? 1 : 0,\n  ts: new Date().toISOString()\n};\nconst key = `fb:${rec.user_id}:${Buffer.from(rec.query_norm).toString('base64').slice(0,24)}`;\nreturn [{ json: { key, value: rec } }];\n"
+      }
+    },
+    {
+      "id": "FeedbackStore",
+      "name": "Feedback Store (Data Store)",
+      "type": "n8n-nodes-base.dataStore",
+      "typeVersion": 1,
+      "position": [
+        -260,
+        360
+      ],
+      "parameters": {
+        "operation": "upsert",
+        "key": "={{$json[\"key\"]}}",
+        "value": "={{$json[\"value\"]}}"
+      }
+    },
+    {
+      "id": "FeedbackRespond",
+      "name": "Respond (Feedback)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        360
+      ],
+      "parameters": {
+        "responseBody": "OK",
+        "responseCode": 200
+      }
+    }
+  ],
+  "connections": {
+    "Chat In (Webhook)": {
+      "main": [
+        [
+          {
+            "node": "A0 Router (Code)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A0 Router (Code)": {
+      "main": [
+        [
+          {
+            "node": "A1 MCP (HTTP Request placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "A2 SQL Plan (Code)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A1 MCP (HTTP Request placeholder)": {
+      "main": [
+        [
+          {
+            "node": "A3 JSONalyze (HTTP Request placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A3 JSONalyze (HTTP Request placeholder)": {
+      "main": [
+        [
+          {
+            "node": "A4 Calc (Code)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A4 Calc (Code)": {
+      "main": [
+        [
+          {
+            "node": "A5 Chart (HTTP Request placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A5 Chart (HTTP Request placeholder)": {
+      "main": [
+        [
+          {
+            "node": "A6 Answer Composer (Code)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A6 Answer Composer (Code)": {
+      "main": [
+        [
+          {
+            "node": "Respond (Webhook)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback In (Webhook)": {
+      "main": [
+        [
+          {
+            "node": "Feedback Handler (Code)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback Handler (Code)": {
+      "main": [
+        [
+          {
+            "node": "Feedback Store (Data Store)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback Store (Data Store)": {
+      "main": [
+        [
+          {
+            "node": "Respond (Feedback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "version": 2
+}
